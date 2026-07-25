@@ -1,4 +1,5 @@
 import json
+import time
 import requests
 
 from pathlib import Path
@@ -52,33 +53,75 @@ def get_page(config, form_id, cursor_id=None):
 
     params = {
         "formId": form_id,
-        "size": 100,
+        "size": 1000,  # [최적화1] 100 → 1000 (API 허용 최대값), 호출 수 1/10
     }
 
     if cursor_id:
         params["cursorId"] = cursor_id
 
-    response = requests.get(url, headers=headers, params=params, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(5):
+        response = requests.get(
+            url, headers=headers, params=params, timeout=30
+        )
+
+        # 호출 한도 초과(429)는 대기 후 재시도 (커서 문제와 무관)
+        if response.status_code == 429:
+            wait = int(response.headers.get("Retry-After", 0) or 0) or (
+                5 * (2 ** attempt)
+            )
+            print(f"호출 한도 초과(429) → {wait}초 대기 후 재시도 ({attempt + 1}/5)")
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+        return response.json()
+
+    raise RuntimeError("429 재시도 한도 초과: 다음 실행 회차에서 재개됩니다")
 
 
-def get_all_rows(config, form_id, checkpoint_dt=None):
+def get_all_rows(config, form_id, start_cursor=None):
     """
     페이지를 순회하며 접수 데이터를 수집.
 
-    [최적화] 첫 페이지에서 정렬 방향을 감지해서,
-    최신순(desc) 정렬이 확인되고 현재 페이지 전체가 체크포인트보다
-    과거 데이터이면 이후 페이지 조회를 중단한다 (전부 더 오래된 데이터이므로).
-    정렬 방향을 확정할 수 없으면 기존처럼 전체 페이지를 조회한다 (안전 우선).
+    [최적화2] 커서 이어읽기:
+    API의 커서(cursorId)는 applyId 기반이므로, 체크포인트의
+    last_apply_id를 시작 커서로 넣으면 그 이후 데이터만 조회된다.
+    → 매 실행이 사실상 1회 호출로 끝남.
+
+    [안전장치] 시작 커서로 조회가 실패하면(만료된 applyId 등)
+    커서 없이 처음부터 전체 조회로 자동 전환한다.
+    이후 신규 판별은 기존 체크포인트 로직이 동일하게 수행하므로
+    중복 전송은 어느 경로에서도 발생하지 않는다.
     """
     all_rows = []
-    cursor_id = None
+    cursor_id = start_cursor
     page = 1
-    order = None  # "desc"(최신순) / "asc"(오래된순) / None(미확정)
+
+    if start_cursor:
+        print(f"FORM {form_id} | 커서 이어읽기 시작: applyId {start_cursor} 이후")
 
     while True:
-        result = get_page(config, form_id, cursor_id)
+        try:
+            result = get_page(config, form_id, cursor_id)
+        except requests.HTTPError as e:
+            # 429는 get_page 안에서 재시도 처리됨.
+            # 여기 도달하는 HTTPError 중 400번대(잘못된 커서 등)만
+            # 전체 조회로 전환하고, 500번대는 그대로 실패시켜
+            # 다음 실행 회차가 이어받게 한다.
+            status = e.response.status_code if e.response is not None else 0
+            if (
+                page == 1
+                and start_cursor is not None
+                and 400 <= status < 500
+                and status != 429
+            ):
+                print(
+                    f"FORM {form_id} | 커서 조회 실패 → 전체 조회로 전환"
+                )
+                start_cursor = None
+                cursor_id = None
+                continue
+            raise
 
         rows = result.get("data", [])
         has_next = result.get("hasNext", False)
@@ -90,34 +133,6 @@ def get_all_rows(config, form_id, checkpoint_dt=None):
         )
 
         all_rows.extend(rows)
-
-        # --- 정렬 방향 감지 (아직 미확정이고, 시각이 다른 행이 있을 때) ---
-        if order is None and len(rows) >= 2:
-            first_dt = parse_dt(rows[0]["submittedAt"])
-            last_dt = parse_dt(rows[-1]["submittedAt"])
-            if first_dt > last_dt:
-                order = "desc"
-                print(f"FORM {form_id} | 정렬 감지: 최신순 (조기 종료 활성)")
-            elif first_dt < last_dt:
-                order = "asc"
-                print(f"FORM {form_id} | 정렬 감지: 오래된순 (전체 조회)")
-            # first_dt == last_dt 이면 다음 페이지에서 재시도
-
-        # --- 조기 종료 판단 ---
-        # 최신순 정렬이 확인된 상태에서, 이 페이지의 '가장 최신' 행조차
-        # 체크포인트보다 엄격히 과거이면 → 이후 페이지는 전부 그보다
-        # 오래된 데이터이므로 더 볼 필요가 없다.
-        if (
-            order == "desc"
-            and checkpoint_dt is not None
-            and rows
-            and max(parse_dt(r["submittedAt"]) for r in rows) < checkpoint_dt
-        ):
-            print(
-                f"FORM {form_id} | 조기 종료: "
-                f"PAGE {page} 전체가 체크포인트 이전 데이터"
-            )
-            break
 
         if not has_next:
             break
@@ -162,10 +177,13 @@ def process_form(config, form, checkpoint_data):
 
     checkpoint_dt = parse_dt(last_submitted_at)
 
-    rows = get_all_rows(config, form_id, checkpoint_dt)
+    # 접수 이력이 있는 폼이면 마지막 applyId부터 이어읽기
+    start_cursor = last_apply_id if last_apply_id > 0 else None
+
+    rows = get_all_rows(config, form_id, start_cursor)
 
     if not rows:
-        print("조회 데이터 없음")
+        print("조회 데이터 없음 (신규 없음)")
         return
 
     rows.sort(
@@ -231,6 +249,7 @@ def main():
 
     for form in forms:
         process_form(config, form, checkpoint_data)
+        time.sleep(1)
 
     print()
     print("=" * 80)
