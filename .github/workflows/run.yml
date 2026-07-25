@@ -1,4 +1,4 @@
-name: kakao-sync
+name: kakao-form-sync
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
 
 # 실행이 겹치지 않도록 방지 (겹치면 중복 전송 위험)
 concurrency:
-  group: kakao-sync
+  group: kakao-form-sync
   cancel-in-progress: false
 
 permissions:
