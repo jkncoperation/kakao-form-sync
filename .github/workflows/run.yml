@@ -1,8 +1,6 @@
 name: kakao-form-sync
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"   # 약 5분 간격 (UTC 기준, 실제로는 수 분 지연 가능)
   workflow_dispatch:          # Actions 탭에서 수동 실행 버튼 활성화
 
 # 실행이 겹치지 않도록 방지 (겹치면 중복 전송 위험)
