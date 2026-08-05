@@ -161,9 +161,15 @@ def process_form(config, form, checkpoint_data):
     form_id = str(form["form_id"])
     form_name = form["form_name"]
 
+    # [폼별 웹훅] 폼에 zapier_webhook이 지정돼 있으면 그것을,
+    # 없으면 기존 공용 웹훅(config 최상위)을 사용
+    webhook_url = form.get("zapier_webhook") or config["zapier_webhook"]
+
     print()
     print("=" * 80)
     print(f"폼 처리 시작 : {form_name}")
+    if form.get("zapier_webhook"):
+        print("(전용 웹훅 사용)")
     print("=" * 80)
 
     if form_id not in checkpoint_data:
@@ -218,7 +224,7 @@ def process_form(config, form, checkpoint_data):
 
     for row in new_rows:
         try:
-            send_to_zapier(config["zapier_webhook"], row)
+            send_to_zapier(webhook_url, row)
             success_count += 1
             print(
                 f"전송성공 | {row['applyId']} | {row.get('name', '')}"
