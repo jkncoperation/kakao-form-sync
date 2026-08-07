@@ -1,41 +1,33 @@
 name: kakao-form-sync
-
 on:
   workflow_dispatch:          # Actions 탭에서 수동 실행 버튼 활성화
-
 # 실행이 겹치지 않도록 방지 (겹치면 중복 전송 위험)
 concurrency:
   group: kakao-form-sync
   cancel-in-progress: false
-
 permissions:
   contents: write             # checkpoint.json 커밋을 위해 필요
-
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: 저장소 체크아웃
         uses: actions/checkout@v5
-
+        with:
+          ref: main           # 트리거 시점이 아닌 실행 시점의 최신 상태를 체크아웃 (중복 방지)
       - name: 파이썬 설정
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
       - name: 의존성 설치
         run: pip install -r requirements.txt
-
       - name: config.json 생성 (Secrets에서)
         env:
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
         run: printf '%s' "$CONFIG_JSON" > config.json
-
       - name: 스크립트 실행
         run: python kakao_sync.py
-
       - name: checkpoint.json 커밋
         if: always()          # 스크립트가 일부 실패해도 저장된 체크포인트는 반영
         run: |
