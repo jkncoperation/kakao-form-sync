@@ -218,29 +218,43 @@ def process_form(config, form, checkpoint_data):
     if not new_rows:
         return
 
-    newest_row = new_rows[-1]
-
     success_count = 0
+    last_success_row = None
 
     for row in new_rows:
         try:
             send_to_zapier(webhook_url, row)
             success_count += 1
+            last_success_row = row
             print(
                 f"전송성공 | {row['applyId']} | {row.get('name', '')}"
             )
         except Exception as e:
+            # [중복 방지] 실패 지점에서 즉시 중단.
+            # 성공한 건까지는 아래에서 체크포인트에 반영되므로
+            # 다음 실행은 '실패한 건부터' 이어서 재시도한다.
+            # (계속 진행하면 순서가 어긋나고, 전체 재전송 시 중복 발생)
             print(f"전송실패 | {row['applyId']} | {e}")
+            print("이후 건은 다음 실행에서 이어서 재시도")
+            break
 
-    if success_count == len(new_rows):
+    # 성공한 건이 하나라도 있으면 그 지점까지 체크포인트 저장
+    if last_success_row is not None:
         checkpoint_data[form_id] = {
-            "last_submitted_at": newest_row["submittedAt"],
-            "last_apply_id": newest_row["applyId"],
+            "last_submitted_at": last_success_row["submittedAt"],
+            "last_apply_id": last_success_row["applyId"],
         }
         save_checkpoint(checkpoint_data)
-        print(f"{form_name} 체크포인트 저장 완료")
+
+        if success_count == len(new_rows):
+            print(f"{form_name} 체크포인트 저장 완료")
+        else:
+            print(
+                f"{form_name} 일부 전송 실패 - "
+                f"{success_count}/{len(new_rows)}건까지 체크포인트 저장"
+            )
     else:
-        print(f"{form_name} 일부 전송 실패")
+        print(f"{form_name} 전송 실패 - 다음 실행에서 재시도")
 
 
 # ============================================================
