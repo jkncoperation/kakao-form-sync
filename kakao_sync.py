@@ -36,24 +36,47 @@ def save_checkpoint(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def get_accounts(config):
+    """
+    [멀티 계정] config에서 계정 목록을 꺼낸다.
+
+    신규 구조: {"accounts": [{access_token, ad_account_id, forms, ...}, ...]}
+    기존 구조: {access_token, ad_account_id, forms, ...}  (계정 1개)
+
+    기존 단일 계정 구조도 그대로 인식하므로,
+    코드만 먼저 교체돼도 기존 Secret으로 정상 작동한다.
+    """
+    if "accounts" in config:
+        return config["accounts"]
+
+    # 기존 단일 계정 구조 → 계정 1개짜리 목록으로 변환
+    return [{
+        "account_name": "기본 계정",
+        "access_token": config["access_token"],
+        "ad_account_id": config["ad_account_id"],
+        "forms": config.get("forms", []),
+        "zapier_webhook": config.get("zapier_webhook"),
+    }]
+
+
 # ============================================================
 # 카카오 비즈니스폼+
 # ============================================================
 
-def get_page(config, form_id, cursor_id=None):
+def get_page(account, form_id, cursor_id=None):
     url = (
         "https://apis.moment.kakao.com"
         "/openapi/v4/adAccounts/bizFormPlus/report"
     )
 
     headers = {
-        "Authorization": f"Bearer {config['access_token']}",
-        "adAccountId": str(config["ad_account_id"]),
+        "Authorization": f"Bearer {account['access_token']}",
+        "adAccountId": str(account["ad_account_id"]),
     }
 
     params = {
         "formId": form_id,
-        "size": 1000,  # [최적화1] 100 → 1000 (API 허용 최대값), 호출 수 1/10
+        "size": 1000,  # [최적화1] API 허용 최대값, 호출 수 최소화
     }
 
     if cursor_id:
@@ -79,19 +102,16 @@ def get_page(config, form_id, cursor_id=None):
     raise RuntimeError("429 재시도 한도 초과: 다음 실행 회차에서 재개됩니다")
 
 
-def get_all_rows(config, form_id, start_cursor=None):
+def get_all_rows(account, form_id, start_cursor=None):
     """
     페이지를 순회하며 접수 데이터를 수집.
 
     [최적화2] 커서 이어읽기:
     API의 커서(cursorId)는 applyId 기반이므로, 체크포인트의
     last_apply_id를 시작 커서로 넣으면 그 이후 데이터만 조회된다.
-    → 매 실행이 사실상 1회 호출로 끝남.
 
-    [안전장치] 시작 커서로 조회가 실패하면(만료된 applyId 등)
+    [안전장치] 시작 커서 조회가 400번대 오류로 실패하면
     커서 없이 처음부터 전체 조회로 자동 전환한다.
-    이후 신규 판별은 기존 체크포인트 로직이 동일하게 수행하므로
-    중복 전송은 어느 경로에서도 발생하지 않는다.
     """
     all_rows = []
     cursor_id = start_cursor
@@ -102,12 +122,11 @@ def get_all_rows(config, form_id, start_cursor=None):
 
     while True:
         try:
-            result = get_page(config, form_id, cursor_id)
+            result = get_page(account, form_id, cursor_id)
         except requests.HTTPError as e:
             # 429는 get_page 안에서 재시도 처리됨.
-            # 여기 도달하는 HTTPError 중 400번대(잘못된 커서 등)만
-            # 전체 조회로 전환하고, 500번대는 그대로 실패시켜
-            # 다음 실행 회차가 이어받게 한다.
+            # 400번대(잘못된 커서 등)만 전체 조회로 전환하고,
+            # 500번대는 그대로 실패시켜 다음 실행 회차가 이어받게 한다.
             status = e.response.status_code if e.response is not None else 0
             if (
                 page == 1
@@ -157,13 +176,16 @@ def send_to_zapier(webhook_url, row):
 # 폼 처리
 # ============================================================
 
-def process_form(config, form, checkpoint_data):
+def process_form(account, form, checkpoint_data, global_webhook=None):
     form_id = str(form["form_id"])
     form_name = form["form_name"]
 
-    # [폼별 웹훅] 폼에 zapier_webhook이 지정돼 있으면 그것을,
-    # 없으면 기존 공용 웹훅(config 최상위)을 사용
-    webhook_url = form.get("zapier_webhook") or config["zapier_webhook"]
+    # [웹훅 선택 순서] 폼별 지정 → 계정별 지정 → 전체 공용
+    webhook_url = (
+        form.get("zapier_webhook")
+        or account.get("zapier_webhook")
+        or global_webhook
+    )
 
     print()
     print("=" * 80)
@@ -171,6 +193,10 @@ def process_form(config, form, checkpoint_data):
     if form.get("zapier_webhook"):
         print("(전용 웹훅 사용)")
     print("=" * 80)
+
+    if not webhook_url:
+        print("웹훅 미지정 - 이 폼은 건너뜀 (config 확인 필요)")
+        return
 
     if form_id not in checkpoint_data:
         checkpoint_data[form_id] = {
@@ -186,7 +212,7 @@ def process_form(config, form, checkpoint_data):
     # 접수 이력이 있는 폼이면 마지막 applyId부터 이어읽기
     start_cursor = last_apply_id if last_apply_id > 0 else None
 
-    rows = get_all_rows(config, form_id, start_cursor)
+    rows = get_all_rows(account, form_id, start_cursor)
 
     if not rows:
         print("조회 데이터 없음 (신규 없음)")
@@ -233,7 +259,6 @@ def process_form(config, form, checkpoint_data):
             # [중복 방지] 실패 지점에서 즉시 중단.
             # 성공한 건까지는 아래에서 체크포인트에 반영되므로
             # 다음 실행은 '실패한 건부터' 이어서 재시도한다.
-            # (계속 진행하면 순서가 어긋나고, 전체 재전송 시 중복 발생)
             print(f"전송실패 | {row['applyId']} | {e}")
             print("이후 건은 다음 실행에서 이어서 재시도")
             break
@@ -265,11 +290,24 @@ def main():
     config = load_config()
     checkpoint_data = load_checkpoint()
 
-    forms = config.get("forms", [])
+    accounts = get_accounts(config)
+    global_webhook = config.get("zapier_webhook")
 
-    for form in forms:
-        process_form(config, form, checkpoint_data)
-        time.sleep(1)
+    for account in accounts:
+        account_name = account.get(
+            "account_name",
+            str(account.get("ad_account_id", "?")),
+        )
+
+        print()
+        print("#" * 80)
+        print(f"# 계정 처리 시작 : {account_name} "
+              f"(adAccountId {account.get('ad_account_id')})")
+        print("#" * 80)
+
+        for form in account.get("forms", []):
+            process_form(account, form, checkpoint_data, global_webhook)
+            time.sleep(1)
 
     print()
     print("=" * 80)
