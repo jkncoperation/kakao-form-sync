@@ -1,7 +1,7 @@
 {
   "MA-937": {
-    "last_submitted_at": "2026-10-08 10:14:02",
-    "last_apply_id": 252716
+    "last_submitted_at": "2026-10-08 10:31:40",
+    "last_apply_id": 252822
   },
   "MA-958": {
     "last_submitted_at": "2026-06-23 10:50:49",
@@ -26,5 +26,13 @@
   "MA-2519": {
     "last_submitted_at": "2026-10-05 11:28:01",
     "last_apply_id": 242262
+  },
+  "MA-2615": {
+    "last_submitted_at": "2000-01-01 00:00:00",
+    "last_apply_id": 0
+  },
+  "MA-2742": {
+    "last_submitted_at": "2026-10-08 10:07:35",
+    "last_apply_id": 252685
   }
 }
